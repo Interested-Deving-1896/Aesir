@@ -111,7 +111,7 @@ namespace Aesir
         public bool AutoCheckForUpdates { get; set; } = true;
         public bool CreateDesktopEntry { get; set; } = true;
         public bool IsFirstRun { get; set; } = true;
-        public string CurrentVersion { get; set; } = "1.0.0";
+        public string CurrentVersion { get; set; } = "1.1.0";
         
         private static readonly string SettingsPath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), 
