@@ -1,3 +1,4 @@
+using Adw;
 using Gtk;
 using System;
 using System.Collections.Generic;
@@ -56,11 +57,55 @@ namespace Aesir
             
             return image;
         }
+
+        public static string GetIconNameForEmbeddedImage(string resourceName, string desiredIconName)
+        {
+            try
+            {
+                var assembly = System.Reflection.Assembly.GetExecutingAssembly();
+                using var stream = assembly.GetManifestResourceStream($"Aesir.assets.{resourceName}");
+                
+                if (stream != null)
+                {
+                    // Create a persistent temporary directory for icons
+                    var iconDir = Path.Combine(Path.GetTempPath(), "aesir_icons");
+                    Directory.CreateDirectory(iconDir);
+                    
+                    var iconPath = Path.Combine(iconDir, desiredIconName + ".png");
+                    
+                    if (!File.Exists(iconPath))
+                    {
+                        using (var fileStream = File.Create(iconPath))
+                        {
+                            stream.CopyTo(fileStream);
+                        }
+                    }
+                    
+                    // Add the directory to the icon theme search path
+                    var display = Gdk.Display.GetDefault();
+                    if (display != null)
+                    {
+                        var iconTheme = Gtk.IconTheme.GetForDisplay(display);
+                        iconTheme.AddSearchPath(iconDir);
+                    }
+                    
+                    return desiredIconName;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to load embedded icon {resourceName}: {ex.Message}");
+            }
+            
+            return "application-x-executable";
+        }
     }
     
     public class AppSettings
     {
         public string Odin4Path { get; set; } = "";
+        public string HeimdallPath { get; set; } = "";
+        public string ThorPath { get; set; } = "";
         public string DefaultFlashTool { get; set; } = "Odin4";
         public string LastUsedDirectory { get; set; } = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
         public bool AutoCheckForUpdates { get; set; } = true;
@@ -204,7 +249,7 @@ StartupNotify=true
         }
     }
     
-    public class OdinMainWindow : Gtk.ApplicationWindow
+    public class OdinMainWindow : Adw.ApplicationWindow
     {
         // Flash tool selection
         public enum FlashTool
@@ -251,9 +296,13 @@ StartupNotify=true
         // Settings
         private AppSettings settings = null!;
         
-        // Odin4 binary detection
+        // Flash tools binary detection
         private bool isOdin4Available = false;
         private string odin4DevicePath = "";
+        private bool isHeimdallAvailable = false;
+        private string heimdallDevicePath = "";
+        private bool isThorAvailable = false;
+        private string thorDevicePath = "";
         
         // Background services
         private System.Threading.Timer? deviceCheckTimer = null;
@@ -331,13 +380,13 @@ StartupNotify=true
         // GAPPS tab controls
         private Gtk.Label gappsLogLabel = null!;
 
-        public OdinMainWindow(Gtk.Application application) : base()
+        public OdinMainWindow(Adw.Application application) : base()
         {
             Application = application;
             Title = "Aesir - Firmware Flash Tool";
             
             SetDefaultSize(1050, 850);
-            SetSizeRequest(1050, 764); // Set minimum size to avoid GTK warning
+            SetSizeRequest(1050, 800); // Set minimum size to avoid GTK warning
             
             // Load settings
             settings = AppSettings.Load();
@@ -346,7 +395,7 @@ StartupNotify=true
             BuildUI();
             ApplyGnomeStyles();
             ConnectSignals();
-            _ = CheckOdin4Availability(); // Fire and forget async call
+            _ = CheckToolsAvailability(); // Fire and forget async call
             
             // Initialize Odin log
             LogMessage("Aesir - Firmware Flash Tool");
@@ -426,8 +475,8 @@ StartupNotify=true
             menuButton.SetMenuModel(primaryMenu);
             headerBar.PackEnd(menuButton);
             
-            // Set the header bar as the title bar
-            SetTitlebar(headerBar);
+            // headerBar will be packed into the window content below
+            
             
             // Create main notebook for tabs
             mainNotebook = Gtk.Notebook.New();
@@ -456,7 +505,14 @@ StartupNotify=true
             var otherTab = CreateOtherTab();
             mainNotebook.AppendPage(otherTab, Gtk.Label.New("Other"));
             
-            Child = mainNotebook;
+            var windowContent = Gtk.Box.New(Gtk.Orientation.Vertical, 0);
+            windowContent.Append(headerBar);
+            
+            // Allow the notebook to expand and fill the remaining space
+            mainNotebook.Vexpand = true;
+            windowContent.Append(mainNotebook);
+            
+            Content = windowContent;
         }
         
         private void ApplyGnomeStyles()
@@ -597,7 +653,7 @@ StartupNotify=true
             flashToolVBox.SetMarginStart(10);
             flashToolVBox.SetMarginEnd(10);
             
-            var flashToolModel = Gtk.StringList.New(new string[] { "Odin4", "Heimdall (SOON)", "Thor (SOON)" });
+            var flashToolModel = Gtk.StringList.New(new string[] { "Odin4", "Heimdall", "Thor" });
             flashToolDropDown = Gtk.DropDown.New(flashToolModel, null);
             
             selectedFlashTool = FlashTool.Odin4;
@@ -611,14 +667,19 @@ StartupNotify=true
                     {
                         selectedFlashTool = FlashTool.Odin4;
                         settings.DefaultFlashTool = "Odin4";
-                        settings.Save();
-                        UpdateFlashToolLabel();
                     }
-                    else
+                    else if (selectedIndex == 1)
                     {
-                        // Don't allow selection of unavailable tools - reset to Odin4
-                        flashToolDropDown.SetSelected(0);
+                        selectedFlashTool = FlashTool.Heimdall;
+                        settings.DefaultFlashTool = "Heimdall";
                     }
+                    else if (selectedIndex == 2)
+                    {
+                        selectedFlashTool = FlashTool.Thor;
+                        settings.DefaultFlashTool = "Thor";
+                    }
+                    settings.Save();
+                    UpdateFlashToolLabel();
                 }
             };
             flashToolVBox.Append(flashToolDropDown);
@@ -2014,40 +2075,76 @@ StartupNotify=true
             
             deviceStatusLabel.SetText("Device Status: Checking connection...");
             
-            // Only Odin4 is supported now
-            if (isOdin4Available)
+            if (selectedFlashTool == FlashTool.Odin4)
             {
-                await HandleOdin4Flashing(files);
+                if (isOdin4Available)
+                {
+                    await HandleFlashing(files, "odin4");
+                }
+                else
+                {
+                    LogMessage($"<OSM> ERROR: Odin4 is not available");
+                    LogMessage($"<OSM> Please install Odin4 or ensure it is in your PATH");
+                    CheckDeviceConnection();
+                }
             }
-            else
+            else if (selectedFlashTool == FlashTool.Heimdall)
             {
-                LogMessage($"<OSM> ERROR: Odin4 is not available");
-                LogMessage($"<OSM> Please install Odin4 or ensure it is in your PATH");
-                CheckDeviceConnection();
+                if (isHeimdallAvailable)
+                {
+                    await HandleFlashing(files, "heimdall");
+                }
+                else
+                {
+                    LogMessage($"<OSM> ERROR: Heimdall is not available");
+                    LogMessage($"<OSM> Please install Heimdall or ensure it is in your PATH");
+                    CheckDeviceConnection();
+                }
+            }
+            else if (selectedFlashTool == FlashTool.Thor)
+            {
+                if (isThorAvailable)
+                {
+                    await HandleFlashing(files, "thor");
+                }
+                else
+                {
+                    LogMessage($"<OSM> ERROR: Thor is not available");
+                    LogMessage($"<OSM> Please install Thor or ensure it is in your PATH");
+                    CheckDeviceConnection();
+                }
             }
         }
         
-        private async Task HandleOdin4Flashing(Dictionary<string, string> files)
+        private async Task HandleFlashing(Dictionary<string, string> files, string toolName)
         {
             try
             {
-                if (!string.IsNullOrEmpty(odin4DevicePath))
-                {
-                }
-                
                 // Start flashing timer
                 isFlashing = true;
                 flashStartTime = DateTime.Now;
                 
                 startButton.Sensitive = false;
-                deviceStatusLabel.SetText("Device Status: Flashing with Odin4");
+                deviceStatusLabel.SetText($"Device Status: Flashing with {toolName}");
                 
                 // Initialize progress bar
                 progressBar?.SetFraction(0.0);
-                progressBar?.SetText("Starting Odin4...");
+                progressBar?.SetText($"Starting {toolName}...");
                 
-                // Execute Odin4 command (will try without sudo first, then with sudo if needed)
-                var success = await ExecuteOdin4CommandWithFallback(files);
+                // Execute command
+                bool success = false;
+                if (toolName == "odin4")
+                {
+                    success = await ExecuteOdin4CommandWithFallback(files);
+                }
+                else if (toolName == "thor")
+                {
+                    success = await ExecuteThorCommandWithFallback(files);
+                }
+                else if (toolName == "heimdall")
+                {
+                    success = await ExecuteHeimdallCommandWithFallback(files);
+                }
                 
                 if (success)
                 {
@@ -2080,26 +2177,47 @@ StartupNotify=true
         {
             try
             {
-                // Only check for Odin4 device
-                if (isOdin4Available)
+                if (selectedFlashTool == FlashTool.Odin4)
                 {
-                    odin4DevicePath = await GetOdin4DevicePath();
-                    
-                    if (!string.IsNullOrEmpty(odin4DevicePath))
+                    if (isOdin4Available)
                     {
-                        deviceStatusLabel.SetText($"Device Status: Ready (Odin4)");
-                        comPortLabel.SetText($"Connection: {odin4DevicePath}");
-                        return;
+                        odin4DevicePath = await GetOdin4DevicePath();
+                        if (!string.IsNullOrEmpty(odin4DevicePath))
+                        {
+                            deviceStatusLabel.SetText($"Device Status: Ready (Odin4)");
+                            comPortLabel.SetText($"Connection: {odin4DevicePath}");
+                            return;
+                        }
                     }
-                    else
+                }
+                else if (selectedFlashTool == FlashTool.Heimdall)
+                {
+                    if (isHeimdallAvailable)
                     {
-                        deviceStatusLabel.SetText("Device Status: Not detected");
-                        comPortLabel.SetText("Connection: None");
-                        return;
+                        heimdallDevicePath = await GetHeimdallDevicePath();
+                        if (!string.IsNullOrEmpty(heimdallDevicePath))
+                        {
+                            deviceStatusLabel.SetText($"Device Status: Ready (Heimdall)");
+                            comPortLabel.SetText($"Connection: {heimdallDevicePath}");
+                            return;
+                        }
+                    }
+                }
+                else if (selectedFlashTool == FlashTool.Thor)
+                {
+                    if (isThorAvailable)
+                    {
+                        thorDevicePath = await GetThorDevicePath();
+                        if (!string.IsNullOrEmpty(thorDevicePath))
+                        {
+                            deviceStatusLabel.SetText($"Device Status: Ready (Thor)");
+                            comPortLabel.SetText($"Connection: {thorDevicePath}");
+                            return;
+                        }
                     }
                 }
 
-                // Fallback to lsusb if Odin4 is not available
+                // Fallback to lsusb if tool is not available or device not detected by tool
                 var process = new Process
                 {
                     StartInfo = new ProcessStartInfo
@@ -2119,8 +2237,8 @@ StartupNotify=true
                 // Check for Samsung device in download mode
                 if (output.Contains("04e8:") || output.Contains("Samsung"))
                 {
-                    deviceStatusLabel.SetText($"Device Status: Ready (Odin4)");
-                    comPortLabel.SetText($"Connection: USB (Odin4)");
+                    deviceStatusLabel.SetText($"Device Status: Ready (USB Fallback)");
+                    comPortLabel.SetText($"Connection: USB Download Mode");
                 }
                 else
                 {
@@ -2167,7 +2285,24 @@ StartupNotify=true
             LogMessage("<OSM> All settings reset to default.");
         }
         
-        private async Task CheckOdin4Availability()
+        private async Task CheckToolsAvailability()
+        {
+            try
+            {
+                isOdin4Available = await CheckBinary("odin4");
+                isHeimdallAvailable = await CheckBinary("heimdall");
+                isThorAvailable = await CheckBinary("thor");
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"<OSM> Error checking for tools: {ex.Message}");
+                isOdin4Available = false;
+                isHeimdallAvailable = false;
+                isThorAvailable = false;
+            }
+        }
+
+        private async Task<bool> CheckBinary(string binaryName)
         {
             try
             {
@@ -2176,7 +2311,7 @@ StartupNotify=true
                     StartInfo = new ProcessStartInfo
                     {
                         FileName = "which",
-                        Arguments = "odin4",
+                        Arguments = binaryName,
                         UseShellExecute = false,
                         RedirectStandardOutput = true,
                         RedirectStandardError = true,
@@ -2188,19 +2323,11 @@ StartupNotify=true
                 var output = await process.StandardOutput.ReadToEndAsync();
                 await process.WaitForExitAsync();
                 
-                isOdin4Available = process.ExitCode == 0 && !string.IsNullOrWhiteSpace(output);
-                
-                if (isOdin4Available)
-                {
-                }
-                else
-                {
-                }
+                return process.ExitCode == 0 && !string.IsNullOrWhiteSpace(output);
             }
-            catch (Exception ex)
+            catch
             {
-                LogMessage($"<OSM> Error checking for Odin4: {ex.Message}");
-                isOdin4Available = false;
+                return false;
             }
         }
         
@@ -2247,6 +2374,78 @@ StartupNotify=true
                 }
             }
             catch (Exception)
+            {
+                return "";
+            }
+        }
+        
+        private async Task<string> GetThorDevicePath()
+        {
+            try
+            {
+                if (!isThorAvailable) return "";
+
+                var process = new Process
+                {
+                    StartInfo = new ProcessStartInfo
+                    {
+                        FileName = "thor",
+                        Arguments = "-l",
+                        UseShellExecute = false,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        CreateNoWindow = true
+                    }
+                };
+
+                process.Start();
+                var output = await process.StandardOutput.ReadToEndAsync();
+                await process.WaitForExitAsync();
+
+                if (process.ExitCode == 0 && !string.IsNullOrWhiteSpace(output))
+                {
+                    return output.Trim();
+                }
+                
+                return "";
+            }
+            catch
+            {
+                return "";
+            }
+        }
+
+        private async Task<string> GetHeimdallDevicePath()
+        {
+            try
+            {
+                if (!isHeimdallAvailable) return "";
+
+                var process = new Process
+                {
+                    StartInfo = new ProcessStartInfo
+                    {
+                        FileName = "heimdall",
+                        Arguments = "detect",
+                        UseShellExecute = false,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        CreateNoWindow = true
+                    }
+                };
+
+                process.Start();
+                var output = await process.StandardOutput.ReadToEndAsync();
+                await process.WaitForExitAsync();
+
+                if (process.ExitCode == 0 && output.Contains("Device detected"))
+                {
+                    return "USB (Heimdall)";
+                }
+                
+                return "";
+            }
+            catch
             {
                 return "";
             }
@@ -2561,6 +2760,201 @@ StartupNotify=true
             {
                 LogMessage($"<OSM> ERROR: Failed to execute Odin4 {(useSudo ? "with sudo" : "without sudo")}: {ex.Message}");
                 return false;
+            }
+        }
+        
+        private async Task<bool> ExecuteThorCommandWithFallback(Dictionary<string, string> files)
+        {
+            try
+            {
+                var process = new Process
+                {
+                    StartInfo = new ProcessStartInfo
+                    {
+                        FileName = "thor-flash-utility",
+                        UseShellExecute = false,
+                        RedirectStandardInput = true,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        CreateNoWindow = true
+                    }
+                };
+                
+                // Fallback to "thor" if "thor-flash-utility" isn't found
+                if (!await CheckBinary("thor-flash-utility") && await CheckBinary("thor"))
+                {
+                    process.StartInfo.FileName = "thor";
+                }
+
+                process.OutputDataReceived += (sender, e) => { if (!string.IsNullOrEmpty(e.Data)) LogMessage($"<THOR> {e.Data}"); };
+                process.ErrorDataReceived += (sender, e) => { if (!string.IsNullOrEmpty(e.Data)) LogMessage($"<THOR> ERROR: {e.Data}"); };
+                
+                process.Start();
+                process.BeginOutputReadLine();
+                process.BeginErrorReadLine();
+                
+                // Pass commands to the Thor shell
+                var writer = process.StandardInput;
+                if (!string.IsNullOrEmpty(files["BL"]) && blCheckButton.Active) await writer.WriteLineAsync($"flashTar \"{files["BL"]}\"");
+                if (!string.IsNullOrEmpty(files["AP"]) && apCheckButton.Active) await writer.WriteLineAsync($"flashTar \"{files["AP"]}\"");
+                if (!string.IsNullOrEmpty(files["CP"]) && cpCheckButton.Active) await writer.WriteLineAsync($"flashTar \"{files["CP"]}\"");
+                if (!string.IsNullOrEmpty(files["CSC"]) && cscCheckButton.Active) await writer.WriteLineAsync($"flashTar \"{files["CSC"]}\"");
+                if (!string.IsNullOrEmpty(files["USERDATA"]) && userdataCheckButton.Active) await writer.WriteLineAsync($"flashTar \"{files["USERDATA"]}\"");
+                
+                await writer.WriteLineAsync("exit");
+                writer.Close();
+                
+                await process.WaitForExitAsync();
+                
+                return process.ExitCode == 0;
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"<OSM> ERROR: Failed to execute Thor: {ex.Message}");
+                return false;
+            }
+        }
+
+        private async Task<bool> ExecuteHeimdallCommandWithFallback(Dictionary<string, string> files)
+        {
+            string tempDir = "";
+            try
+            {
+                var heimdallArgs = new List<string>();
+                heimdallArgs.Add("flash");
+                
+                // Create temp directory for extraction
+                tempDir = Path.Combine(Path.GetTempPath(), "aesir_heimdall_" + Guid.NewGuid().ToString().Substring(0, 8));
+                Directory.CreateDirectory(tempDir);
+                LogMessage($"<HEIMDALL> Created temporary extraction directory: {tempDir}");
+
+                // Helper to extract tar
+                async Task<bool> ExtractTar(string archivePath)
+                {
+                    LogMessage($"<HEIMDALL> Extracting {Path.GetFileName(archivePath)}...");
+                    var tarProcess = new Process
+                    {
+                        StartInfo = new ProcessStartInfo
+                        {
+                            FileName = "tar",
+                            Arguments = $"-xf \"{archivePath}\" -C \"{tempDir}\"",
+                            UseShellExecute = false,
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true,
+                            CreateNoWindow = true
+                        }
+                    };
+                    tarProcess.Start();
+                    await tarProcess.WaitForExitAsync();
+                    if (tarProcess.ExitCode != 0)
+                    {
+                        LogMessage($"<HEIMDALL> ERROR: Failed to extract {Path.GetFileName(archivePath)}");
+                        return false;
+                    }
+                    return true;
+                }
+
+                // Extract all provided archives
+                if (!string.IsNullOrEmpty(files["BL"]) && blCheckButton.Active) await ExtractTar(files["BL"]);
+                if (!string.IsNullOrEmpty(files["AP"]) && apCheckButton.Active) await ExtractTar(files["AP"]);
+                if (!string.IsNullOrEmpty(files["CP"]) && cpCheckButton.Active) await ExtractTar(files["CP"]);
+                if (!string.IsNullOrEmpty(files["CSC"]) && cscCheckButton.Active) await ExtractTar(files["CSC"]);
+                if (!string.IsNullOrEmpty(files["USERDATA"]) && userdataCheckButton.Active) await ExtractTar(files["USERDATA"]);
+
+                var extractedFiles = Directory.GetFiles(tempDir);
+                var partitionMap = new Dictionary<string, string>
+                {
+                    { "boot.img", "--BOOT" },
+                    { "recovery.img", "--RECOVERY" },
+                    { "system.img", "--SYSTEM" },
+                    { "cache.img", "--CACHE" },
+                    { "hidden.img", "--HIDDEN" },
+                    { "modem.bin", "--MODEM" },
+                    { "sboot.bin", "--BOOTLOADER" },
+                    { "param.bin", "--PARAM" }
+                };
+
+                bool filesAdded = false;
+                foreach (var originalFile in extractedFiles)
+                {
+                    var file = originalFile;
+                    var fileName = Path.GetFileName(file).ToLower();
+                    
+                    if (fileName.EndsWith(".lz4"))
+                    {
+                        LogMessage($"<HEIMDALL> Decompressing LZ4 file: {fileName}");
+                        var lz4Process = new Process { StartInfo = new ProcessStartInfo { FileName = "unlz4", Arguments = $"--rm \"{file}\"", UseShellExecute = false, CreateNoWindow = true } };
+                        try 
+                        {
+                            lz4Process.Start();
+                            await lz4Process.WaitForExitAsync();
+                            file = file.Substring(0, file.Length - 4);
+                            fileName = Path.GetFileName(file).ToLower();
+                        }
+                        catch (Exception ex)
+                        {
+                            LogMessage($"<HEIMDALL> Failed to decompress lz4: {ex.Message}. Make sure 'lz4' is installed.");
+                        }
+                    }
+
+                    if (partitionMap.TryGetValue(fileName, out string arg))
+                    {
+                        heimdallArgs.Add($"{arg} \"{file}\"");
+                        filesAdded = true;
+                    }
+                }
+                
+                if (!filesAdded)
+                {
+                    LogMessage("<HEIMDALL> ERROR: No supported partition images found in the extracted files.");
+                    return false;
+                }
+                
+                var commandArgs = string.Join(" ", heimdallArgs);
+                LogMessage($"<HEIMDALL> Executing Heimdall with extracted images...");
+                
+                var process = new Process
+                {
+                    StartInfo = new ProcessStartInfo
+                    {
+                        FileName = "heimdall",
+                        Arguments = commandArgs,
+                        UseShellExecute = false,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        CreateNoWindow = true
+                    }
+                };
+                
+                process.OutputDataReceived += (sender, e) => { if (!string.IsNullOrEmpty(e.Data)) LogMessage($"<HEIMDALL> {e.Data}"); };
+                process.ErrorDataReceived += (sender, e) => { if (!string.IsNullOrEmpty(e.Data)) LogMessage($"<HEIMDALL> ERROR: {e.Data}"); };
+                
+                process.Start();
+                process.BeginOutputReadLine();
+                process.BeginErrorReadLine();
+                
+                await process.WaitForExitAsync();
+                
+                return process.ExitCode == 0;
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"<OSM> ERROR: Failed to execute Heimdall: {ex.Message}");
+                return false;
+            }
+            finally
+            {
+                if (!string.IsNullOrEmpty(tempDir) && Directory.Exists(tempDir))
+                {
+                    try
+                    {
+                        Directory.Delete(tempDir, true);
+                    }
+                    catch (Exception ex)
+                    {
+                        LogMessage($"<HEIMDALL> Warning: Failed to cleanup temp dir: {ex.Message}");
+                    }
+                }
             }
         }
         
@@ -5225,14 +5619,21 @@ StartupNotify=true
             var flashToolLabel = Gtk.Label.New("Default Flash Tool:");
             flashToolLabel.SetHalign(Gtk.Align.Start);
             flashToolLabel.SetSizeRequest(150, -1);
-            var flashToolDropdown = Gtk.DropDown.NewFromStrings(new[] { "Odin4" });
-            flashToolDropdown.SetSelected(0);
-            flashToolDropdown.Sensitive = false; // Only one option
+            var flashToolDropdown = Gtk.DropDown.NewFromStrings(new[] { "Odin4", "Heimdall", "Thor" });
+            
+            if (settings.DefaultFlashTool == "Heimdall") flashToolDropdown.SetSelected(1);
+            else if (settings.DefaultFlashTool == "Thor") flashToolDropdown.SetSelected(2);
+            else flashToolDropdown.SetSelected(0);
+            
+            flashToolDropdown.Sensitive = true;
             flashToolDropdown.OnNotify += (sender, args) =>
             {
                 if (args.Pspec.GetName() == "selected")
                 {
-                    settings.DefaultFlashTool = "Odin4";
+                    var idx = flashToolDropdown.Selected;
+                    if (idx == 0) settings.DefaultFlashTool = "Odin4";
+                    else if (idx == 1) settings.DefaultFlashTool = "Heimdall";
+                    else if (idx == 2) settings.DefaultFlashTool = "Thor";
                     settings.Save();
                 }
             };
@@ -5497,11 +5898,12 @@ StartupNotify=true
         }
     }
     
-    public class AesirApplication : Gtk.Application
+    public class AesirApplication : Adw.Application
     {
         public AesirApplication() : base()
         {
             ApplicationId = "com.aesir";
+            Flags = Gio.ApplicationFlags.FlagsNone;
         }
         
         private void InitializeActions()
@@ -5525,240 +5927,25 @@ StartupNotify=true
         {
             var settings = AppSettings.Load();
             
-            // Create the dialog window
-            var dialog = Gtk.Window.New();
-            dialog.SetTitle("About Aesir");
-            dialog.SetDefaultSize(400, 500);
-            dialog.SetResizable(false);
-            dialog.SetModal(true);
+            var about = Adw.AboutWindow.New();
+            about.ApplicationName = "Aesir";
+            about.ApplicationIcon = ImageHelper.GetIconNameForEmbeddedImage("A.png", "aesir-app-icon");
+            about.Version = settings.CurrentVersion;
+            about.DeveloperName = "daglaroglou";
+            about.Copyright = "© 2025 Aesir Project";
+            about.LicenseType = Gtk.License.Gpl30;
+            about.Website = "https://github.com/daglaroglou/Aesir";
+            about.IssueUrl = "https://github.com/daglaroglou/Aesir/issues";
+            
+            about.AddLink("Donate", "https://github.com/sponsors/daglaroglou");
             
             var window = GetActiveWindow();
             if (window != null)
             {
-                dialog.SetTransientFor(window);
+                about.SetTransientFor(window);
             }
-
-            // Add custom header bar like the updater
-            var headerBar = Gtk.HeaderBar.New();
-            headerBar.SetTitleWidget(Gtk.Label.New("About Aesir"));
-            headerBar.ShowTitleButtons = false;
-            dialog.SetTitlebar(headerBar);
             
-            // Close button
-            var closeButton = Gtk.Button.NewFromIconName("window-close-symbolic");
-            closeButton.OnClicked += (sender, args) => dialog.Destroy();
-            headerBar.PackEnd(closeButton);
-
-            // Main container with padding
-            var mainBox = Gtk.Box.New(Gtk.Orientation.Vertical, 0);
-            mainBox.SetMarginTop(32);
-            mainBox.SetMarginBottom(32);
-            mainBox.SetMarginStart(32);
-            mainBox.SetMarginEnd(32);
-
-            // App icon - using embedded image
-            var iconImage = ImageHelper.LoadEmbeddedImage("A.png", 128);
-            
-            // Add the icon directly without circular frame
-            iconImage.SetHalign(Gtk.Align.Center);
-            iconImage.SetMarginBottom(12);
-            
-            mainBox.Append(iconImage);
-
-            // Subtitle
-            var subtitleLabel = Gtk.Label.New("Samsung Firmware Flashing Tool");
-            subtitleLabel.AddCssClass("subtitle");
-            subtitleLabel.SetHalign(Gtk.Align.Center);
-            subtitleLabel.SetMarginBottom(16);
-            mainBox.Append(subtitleLabel);
-
-            // Version (clickable button)
-            var versionButton = Gtk.Button.NewWithLabel(settings.CurrentVersion);
-            versionButton.AddCssClass("version-button");
-            versionButton.AddCssClass("caption");
-            versionButton.SetHalign(Gtk.Align.Center);
-            versionButton.SetMarginBottom(32);
-            versionButton.OnClicked += (sender, args) => {
-                try {
-                    var releaseUrl = $"https://github.com/daglaroglou/Aesir/releases/tag/v{settings.CurrentVersion}";
-                    System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo {
-                        FileName = releaseUrl,
-                        UseShellExecute = true
-                    });
-                } catch { }
-            };
-            mainBox.Append(versionButton);
-
-            // Action buttons container
-            var buttonsBox = Gtk.Box.New(Gtk.Orientation.Vertical, 8);
-            buttonsBox.SetHalign(Gtk.Align.Fill);
-            buttonsBox.SetMarginBottom(24);
-
-            // Website button
-            var websiteButton = Gtk.Button.New();
-            var websiteBox = Gtk.Box.New(Gtk.Orientation.Horizontal, 8);
-            var websiteIcon = Gtk.Image.NewFromIconName("folder-remote-symbolic");
-            websiteIcon.SetIconSize(Gtk.IconSize.Normal);
-            var websiteLabel = Gtk.Label.New("Repository");
-            websiteBox.Append(websiteIcon);
-            websiteBox.Append(websiteLabel);
-            websiteBox.SetHalign(Gtk.Align.Center);
-            websiteButton.SetChild(websiteBox);
-            websiteButton.AddCssClass("pill");
-            websiteButton.SetHalign(Gtk.Align.Fill);
-            websiteButton.OnClicked += (sender, args) => {
-                try {
-                    System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo {
-                        FileName = "https://github.com/daglaroglou/Aesir",
-                        UseShellExecute = true
-                    });
-                } catch { }
-            };
-            buttonsBox.Append(websiteButton);
-
-            // Report an Issue button
-            var issueButton = Gtk.Button.New();
-            var issueBox = Gtk.Box.New(Gtk.Orientation.Horizontal, 8);
-            var issueIcon = Gtk.Image.NewFromIconName("dialog-warning-symbolic");
-            issueIcon.SetIconSize(Gtk.IconSize.Normal);
-            var issueLabel = Gtk.Label.New("Report an Issue");
-            issueBox.Append(issueIcon);
-            issueBox.Append(issueLabel);
-            issueBox.SetHalign(Gtk.Align.Center);
-            issueButton.SetChild(issueBox);
-            issueButton.AddCssClass("pill");
-            issueButton.SetHalign(Gtk.Align.Fill);
-            issueButton.OnClicked += (sender, args) => {
-                try {
-                    System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo {
-                        FileName = "https://github.com/daglaroglou/Aesir/issues",
-                        UseShellExecute = true
-                    });
-                } catch { }
-            };
-            buttonsBox.Append(issueButton);
-
-            // Donate button
-            var donateButton = Gtk.Button.New();
-            var donateBox = Gtk.Box.New(Gtk.Orientation.Horizontal, 8);
-            var donateIcon = Gtk.Image.NewFromIconName("emblem-favorite-symbolic");
-            donateIcon.SetIconSize(Gtk.IconSize.Normal);
-            var donateLabel = Gtk.Label.New("Donate");
-            donateBox.Append(donateIcon);
-            donateBox.Append(donateLabel);
-            donateBox.SetHalign(Gtk.Align.Center);
-            donateButton.SetChild(donateBox);
-            donateButton.AddCssClass("pill");
-            donateButton.SetHalign(Gtk.Align.Fill);
-            donateButton.OnClicked += (sender, args) => {
-                try {
-                    System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo {
-                        FileName = "https://github.com/sponsors/daglaroglou",
-                        UseShellExecute = true
-                    });
-                } catch { }
-            };
-            buttonsBox.Append(donateButton);
-
-            mainBox.Append(buttonsBox);
-
-            // Credits expander
-            var creditsExpander = Gtk.Expander.New("Credits");
-            creditsExpander.SetMarginBottom(8);
-            
-            var creditsBox = Gtk.Box.New(Gtk.Orientation.Vertical, 8);
-            creditsBox.SetMarginTop(12);
-            creditsBox.SetMarginStart(16);
-            
-            var authorLabel = Gtk.Label.New("Developer: daglaroglou");
-            authorLabel.SetHalign(Gtk.Align.Start);
-            authorLabel.AddCssClass("body");
-            creditsBox.Append(authorLabel);
-            
-            creditsExpander.SetChild(creditsBox);
-            mainBox.Append(creditsExpander);
-
-            // Legal expander
-            var legalExpander = Gtk.Expander.New("Legal");
-            legalExpander.SetMarginBottom(16);
-            
-            var legalBox = Gtk.Box.New(Gtk.Orientation.Vertical, 8);
-            legalBox.SetMarginTop(12);
-            legalBox.SetMarginStart(16);
-            
-            var copyrightLabel = Gtk.Label.New("© 2025 Aesir Project");
-            copyrightLabel.SetHalign(Gtk.Align.Start);
-            copyrightLabel.AddCssClass("body");
-            legalBox.Append(copyrightLabel);
-            
-            var licenseLabel = Gtk.Label.New("Licensed under GNU General Public License v3.0");
-            licenseLabel.SetHalign(Gtk.Align.Start);
-            licenseLabel.AddCssClass("caption");
-            licenseLabel.SetWrap(true);
-            legalBox.Append(licenseLabel);
-            
-            legalExpander.SetChild(legalBox);
-            mainBox.Append(legalExpander);
-
-            dialog.SetChild(mainBox);
-            
-            // Add custom CSS for styling
-            AddAboutDialogCSS();
-            
-            dialog.Show();
-        }
-
-        private void AddAboutDialogCSS()
-        {
-            var cssProvider = Gtk.CssProvider.New();
-            var css = @"
-                .circular-frame {
-                    border-radius: 64px;
-                    background: alpha(@theme_fg_color, 0.1);
-                    border: none;
-                    padding: 16px;
-                }
-                
-                .pill {
-                    border-radius: 20px;
-                    padding: 8px 16px;
-                    border: 1px solid alpha(@theme_fg_color, 0.2);
-                    background: alpha(@theme_fg_color, 0.05);
-                }
-                
-                .pill:hover {
-                    background: alpha(@theme_fg_color, 0.1);
-                }
-                
-                .version-button {
-                    background: alpha(white, 0.1);
-                    border: 1px solid alpha(white, 0.2);
-                    border-radius: 16px;
-                    padding: 4px 8px;
-                    color: @theme_fg_color;
-                    font-size: 0.8em;
-                }
-                
-                .version-button:hover {
-                    background: alpha(white, 0.2);
-                    border-color: alpha(white, 0.3);
-                }
-                
-                .version-button:active {
-                    background: alpha(white, 0.15);
-                }
-                
-                expander title {
-                    font-weight: 600;
-                }
-            ";
-            
-            cssProvider.LoadFromString(css);
-            Gtk.StyleContext.AddProviderForDisplay(
-                Gdk.Display.GetDefault()!,
-                cssProvider,
-                600 // GTK_STYLE_PROVIDER_PRIORITY_APPLICATION
-            );
+            about.Show();
         }
         
         private void OnSettingsActivate(object? sender, EventArgs e)
